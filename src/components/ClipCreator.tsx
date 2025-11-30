@@ -19,6 +19,8 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
   const [clipDuration, setClipDuration] = useState(30);
   const [generating, setGenerating] = useState(false);
   const [generatedClips, setGeneratedClips] = useState<VideoClip[]>([]);
+  const [exportingClipId, setExportingClipId] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
 
@@ -28,10 +30,18 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
   }, [video]);
 
   const loadVideoUrl = async () => {
-    const { data } = supabase.storage
-      .from('videos')
-      .getPublicUrl(video.file_path);
-    setVideoUrl(data.publicUrl);
+    try {
+      const { data, error } = supabase.storage
+        .from('videos')
+        .getPublicUrl(video.file_path);
+
+      if (error) throw error;
+
+      setVideoUrl(data.publicUrl);
+    } catch (error) {
+      console.error('Failed to load video URL', error);
+      setErrorMessage('Gagal memuat video. Periksa koneksi atau konfigurasi storage.');
+    }
   };
 
   const loadExistingClips = async () => {
@@ -41,9 +51,13 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
       .eq('video_id', video.id)
       .order('start_time', { ascending: true });
 
-    if (!error && data) {
-      setGeneratedClips(data);
+    if (error) {
+      console.error('Error loading clips:', error);
+      setErrorMessage('Tidak bisa memuat klip yang sudah dibuat.');
+      return;
     }
+
+    setGeneratedClips(data || []);
   };
 
   const autoGenerateClips = () => {
@@ -87,6 +101,11 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
       return;
     }
 
+    if (clips.some((clip) => clip.duration <= 0)) {
+      alert('Clip duration must be greater than 0 seconds');
+      return;
+    }
+
     setGenerating(true);
 
     try {
@@ -122,6 +141,149 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
   const downloadClip = (clip: VideoClip) => {
     const url = `${videoUrl}#t=${clip.start_time},${clip.start_time + clip.duration}`;
     window.open(url, '_blank');
+  };
+
+  const exportPortraitClip = async (clip: VideoClip) => {
+    if (!videoUrl) {
+      setErrorMessage('Video belum siap diekspor.');
+      return;
+    }
+
+    if (typeof window.MediaRecorder === 'undefined') {
+      setErrorMessage('Browser tidak mendukung MediaRecorder untuk ekspor 9:16.');
+      return;
+    }
+
+    setErrorMessage(null);
+
+    try {
+      setExportingClipId(clip.id);
+
+      const sourceVideo = document.createElement('video');
+      sourceVideo.src = videoUrl;
+      sourceVideo.crossOrigin = 'anonymous';
+      sourceVideo.muted = false;
+      sourceVideo.volume = 0;
+      sourceVideo.playsInline = true;
+
+      await new Promise<void>((resolve, reject) => {
+        sourceVideo.onloadedmetadata = () => resolve();
+        sourceVideo.onerror = () => reject(new Error('Failed to load video for export'));
+      });
+
+      sourceVideo.currentTime = clip.start_time;
+      await new Promise<void>((resolve) => {
+        sourceVideo.onseeked = () => resolve();
+      });
+
+      if (!sourceVideo.captureStream) {
+        throw new Error('Browser tidak mendukung captureStream pada elemen video.');
+      }
+
+      const canvas = document.createElement('canvas');
+      // 9:16 aspect ratio for TikTok/Reels/Shorts
+      canvas.width = 720;
+      canvas.height = 1280;
+      const ctx = canvas.getContext('2d');
+
+      if (!ctx) throw new Error('Canvas is not supported in this browser');
+
+      const canvasStream = canvas.captureStream();
+      const sourceStream = sourceVideo.captureStream();
+      const audioTracks = sourceStream.getAudioTracks();
+
+      const composedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioTracks,
+      ]);
+
+      const preferredMimeTypes = [
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+      ];
+
+      const mimeType = preferredMimeTypes.find((type) => MediaRecorder.isTypeSupported(type));
+
+      if (!mimeType) {
+        throw new Error('Format video/webm tidak didukung oleh browser ini.');
+      }
+
+      const recorder = new MediaRecorder(composedStream, {
+        mimeType,
+      });
+      const chunks: BlobPart[] = [];
+      let recordingStopped = false;
+
+      const drawFrame = () => {
+        if (recordingStopped || recorder.state === 'inactive') return;
+
+        const sourceRatio = sourceVideo.videoWidth / sourceVideo.videoHeight;
+        const targetRatio = canvas.width / canvas.height;
+
+        let drawWidth = canvas.width;
+        let drawHeight = canvas.height;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        if (sourceRatio > targetRatio) {
+          drawHeight = canvas.height;
+          drawWidth = sourceVideo.videoWidth * (drawHeight / sourceVideo.videoHeight);
+          offsetX = -(drawWidth - canvas.width) / 2;
+        } else {
+          drawWidth = canvas.width;
+          drawHeight = sourceVideo.videoHeight * (drawWidth / sourceVideo.videoWidth);
+          offsetY = -(drawHeight - canvas.height) / 2;
+        }
+
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(sourceVideo, offsetX, offsetY, drawWidth, drawHeight);
+        requestAnimationFrame(drawFrame);
+      };
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      const stopRecording = () => {
+        if (recordingStopped) return;
+        recordingStopped = true;
+        recorder.stop();
+        composedStream.getTracks().forEach((track) => track.stop());
+        sourceStream.getTracks().forEach((track) => track.stop());
+        sourceVideo.pause();
+      };
+
+      const recordingPromise = new Promise<Blob>((resolve, reject) => {
+        recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+        recorder.onerror = (event) => reject(event.error || new Error('Failed to export clip'));
+      });
+
+      recorder.start();
+      await sourceVideo.play();
+      requestAnimationFrame(drawFrame);
+
+      setTimeout(stopRecording, clip.duration * 1000);
+
+      const blob = await recordingPromise;
+      stopRecording();
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `${clip.title.replace(/\s+/g, '-').toLowerCase()}-portrait.webm`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error('Failed to export clip', error);
+      setErrorMessage('Gagal membuat video potrait. Coba lagi di browser lain jika masalah berlanjut.');
+    } finally {
+      setExportingClipId(null);
+    }
   };
 
   const formatTime = (seconds: number) => {
@@ -237,6 +399,14 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
               <h4 className="font-semibold text-gray-700 mb-3">
                 Generated Clips ({generatedClips.length})
               </h4>
+              {errorMessage && (
+                <div className="mb-3 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">
+                  {errorMessage}
+                </div>
+              )}
+              <p className="text-sm text-gray-600 mb-3">
+                Ekspor setiap klip langsung ke format vertikal 9:16 yang cocok untuk TikTok, Instagram Reels, atau YouTube Shorts.
+              </p>
               {generatedClips.length === 0 ? (
                 <div className="text-center py-8 text-gray-500">
                   <Scissors className="w-12 h-12 mx-auto mb-2 opacity-30" />
@@ -259,12 +429,21 @@ export function ClipCreator({ video, onClose }: ClipCreatorProps) {
                             Duration: {formatTime(clip.duration)}
                           </p>
                         </div>
-                        <button
-                          onClick={() => downloadClip(clip)}
-                          className="ml-2 bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 transition-colors"
-                        >
-                          <Download className="w-4 h-4" />
-                        </button>
+                        <div className="flex gap-2 ml-2">
+                          <button
+                            onClick={() => downloadClip(clip)}
+                            className="bg-gray-100 text-gray-800 p-2 rounded-lg hover:bg-gray-200 transition-colors"
+                          >
+                            <Download className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => exportPortraitClip(clip)}
+                            disabled={exportingClipId === clip.id}
+                            className="bg-blue-600 text-white px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400"
+                          >
+                            {exportingClipId === clip.id ? 'Membuat 9:16...' : 'Ekspor 9:16'}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ))}
