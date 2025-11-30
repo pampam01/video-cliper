@@ -20,6 +20,12 @@ export function VideoUpload({ onUploadComplete }: VideoUploadProps) {
       return;
     }
 
+    const maxSizeMb = 500;
+    if (file.size / (1024 * 1024) > maxSizeMb) {
+      setError(`Video is too large. Please upload a file smaller than ${maxSizeMb}MB.`);
+      return;
+    }
+
     setUploading(true);
     setError(null);
     setProgress(0);
@@ -46,6 +52,11 @@ export function VideoUpload({ onUploadComplete }: VideoUploadProps) {
 
       const video = document.createElement('video');
       video.preload = 'metadata';
+
+      video.onerror = () => {
+        setError('Failed to read video metadata. Please try another file.');
+        setUploading(false);
+      };
 
       video.onloadedmetadata = async () => {
         window.URL.revokeObjectURL(video.src);
